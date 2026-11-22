@@ -1,0 +1,32 @@
+name: Grilla Futbol Kalshi
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  generar-grilla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install requests
+
+      - name: Consultar Kalshi y generar grilla
+        run: python grilla_futbol.py
+
+      - name: Guardar GRILLA.md en el repositorio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add GRILLA.md
+          git diff --staged --quiet || (git commit -m "Actualizar grilla de futbol moneyline" && git push)
