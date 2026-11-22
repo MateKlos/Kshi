@@ -1,6 +1,8 @@
+from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import time
 import requests
 
 BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
@@ -14,7 +16,6 @@ EXCLUIR_DEPORTE = (
     "rugby",
 )
 
-# Pistas para detectar cuáles mercados dentro del partido corresponden al Moneyline
 NO_ES_MONEYLINE = (
     "total",
     "over ",
@@ -56,10 +57,19 @@ def to_decimal(val) -> Decimal | None:
         return None
 
 
-def get_json(path: str, params: dict | None = None) -> dict:
-    resp = requests.get(f"{BASE_URL}{path}", params=params, timeout=20)
+def get_json(path: str, params: dict | None = None, reintentos: int = 4) -> dict:
+    url = f"{BASE_URL}{path}"
+    for intento in range(reintentos):
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code == 429:
+            espera = 1.5 * (intento + 1)
+            print(f"[Rate limit 429] Esperando {espera:.1f}s...", flush=True)
+            time.sleep(espera)
+            continue
+        resp.raise_for_status()
+        return resp.json()
     resp.raise_for_status()
-    return resp.json()
+    return {}
 
 
 def get_volumen(market: dict) -> Decimal:
@@ -86,14 +96,12 @@ def es_serie_futbol(series: dict) -> bool:
     cat = str(series.get("category") or "").lower()
     tags = " ".join(str(t).lower() for t in (series.get("tags") or []))
     texto = f"{cat} {tags} {str(series.get('title') or '').lower()} {str(series.get('ticker') or '').lower()}"
-
     if any(bad in texto for bad in EXCLUIR_DEPORTE):
         return False
-
     return "soccer" in texto or "football" in texto
 
 
-def es_mercado_moneyline(market: dict, event: dict) -> bool:
+def es_mercado_moneyline(market: dict, event_titulo: str = "") -> bool:
     texto = " ".join(
         str(x or "").lower()
         for x in (
@@ -102,18 +110,16 @@ def es_mercado_moneyline(market: dict, event: dict) -> bool:
             market.get("subtitle"),
             market.get("yes_sub_title"),
             market.get("no_sub_title"),
-            event.get("title"),
-            event.get("sub_title"),
+            event_titulo,
         )
     )
-
     if any(bad in texto for bad in NO_ES_MONEYLINE):
         return False
-
     return any(pista in texto for pista in SI_ES_MONEYLINE)
 
 
-def obtener_series_futbol() -> list[dict]:
+def obtener_series_futbol() -> dict[str, str]:
+    """Devuelve un diccionario {series_ticker: titulo_competicion}."""
     series_list = []
     for params in ({"category": "Sports"}, {}):
         try:
@@ -126,85 +132,109 @@ def obtener_series_futbol() -> list[dict]:
         except requests.HTTPError:
             continue
 
-    unicas = {}
+    resultado = {}
     for s in series_list:
         t = s.get("ticker")
         if t:
-            unicas[t] = s
-    return list(unicas.values())
+            resultado[t] = s.get("title") or t
+    return resultado
 
 
 def obtener_grilla(
     min_vol_moneyline: Decimal = Decimal("10000"),
     max_prob: Decimal = Decimal("0.10"),
+    max_paginas_mercados: int = 30,
 ) -> tuple[list[dict], int, int, int]:
+    t0 = time.monotonic()
     series_futbol = obtener_series_futbol()
-    eventos_vistos = 0
+    print(f"Series de fútbol detectadas: {len(series_futbol)} ({time.monotonic() - t0:.1f}s)", flush=True)
+
+    # Traemos mercados abiertos en lotes grandes y agrupamos por event_ticker
+    mercados_por_evento: dict[str, list[dict]] = defaultdict(list)
+    cursor = None
+    paginas = 0
+
+    while paginas < max_paginas_mercados:
+        params = {"status": "open", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+
+        data = get_json("/markets", params=params)
+        mercados = data.get("markets") or []
+        paginas += 1
+
+        for m in mercados:
+            ev_ticker = m.get("event_ticker")
+            if ev_ticker:
+                mercados_por_evento[ev_ticker].append(m)
+
+        print(
+            f"Página {paginas} de mercados ({len(mercados)} items, {len(mercados_por_evento)} eventos acumulados) - {time.monotonic() - t0:.1f}s",
+            flush=True,
+        )
+
+        cursor = data.get("cursor")
+        if not cursor or not mercados:
+            break
+
+    # Filtramos eventos que pertenezcan a series de fútbol (o que tengan el mercado en una serie de fútbol)
     eventos_calificados = 0
     filas = []
 
-    for serie in series_futbol:
-        series_ticker = serie["ticker"]
-        serie_titulo = serie.get("title") or series_ticker
+    for ev_ticker, mercados in mercados_por_evento.items():
+        primer_m = mercados[0]
+        serie_ticker = primer_m.get("series_ticker") or ""
 
-        cursor = None
-        while True:
-            params = {"status": "open", "series_ticker": series_ticker, "limit": 200}
-            if cursor:
-                params["cursor"] = cursor
+        # Verificamos si es de fútbol por series_ticker o por texto del mercado/evento
+        es_futbol = serie_ticker in series_futbol
+        if not es_futbol:
+            texto_ev = f"{ev_ticker} {serie_ticker} {primer_m.get('title') or ''}".lower()
+            if not any(bad in texto_ev for bad in EXCLUIR_DEPORTE) and (
+                "soccer" in texto_ev or "football" in texto_ev
+            ):
+                es_futbol = True
 
-            ev_data = get_json("/events", params=params)
-            eventos = ev_data.get("events") or []
-            eventos_vistos += len(eventos)
+        if not es_futbol:
+            continue
 
-            for ev in eventos:
-                event_ticker = ev.get("event_ticker")
-                if not event_ticker:
-                    continue
+        evento_titulo = primer_m.get("title") or ev_ticker
+        competicion = series_futbol.get(serie_ticker) or serie_ticker or "Fútbol"
 
-                m_data = get_json("/markets", params={"event_ticker": event_ticker, "limit": 200})
-                mercados = m_data.get("markets") or []
-                if not mercados:
-                    continue
+        # PASO 1: Volumen del moneyline del evento
+        vols_ml = [get_volumen(m) for m in mercados if es_mercado_moneyline(m, evento_titulo)]
+        vol_ml_evento = max(vols_ml) if vols_ml else Decimal("0")
 
-                # PASO 1: Verificar si el Moneyline de este evento supera el umbral de volumen
-                vols_ml = [get_volumen(m) for m in mercados if es_mercado_moneyline(m, ev)]
-                vol_ml_evento = max(vols_ml) if vols_ml else Decimal("0")
+        if vol_ml_evento <= min_vol_moneyline:
+            continue
 
-                if vol_ml_evento <= min_vol_moneyline:
-                    continue
+        eventos_calificados += 1
 
-                eventos_calificados += 1
+        # PASO 2: Todos los mercados del evento (sin filtro de volumen individual)
+        for m in mercados:
+            vol_mercado = get_volumen(m)
+            mercado_nombre = m.get("title") or m.get("subtitle") or m.get("ticker", "")
 
-                # PASO 2: Revisar TODOS los mercados del evento (sin filtro de volumen individual)
-                for m in mercados:
-                    vol_mercado = get_volumen(m)
-                    mercado_nombre = m.get("title") or m.get("subtitle") or m.get("ticker", "")
-
-                    for side in ("yes", "no"):
-                        prob = get_prob_en_dolares(m, side)
-                        if prob is not None and prob <= max_prob:
-                            filas.append(
-                                {
-                                    "competicion": serie_titulo,
-                                    "partido": ev.get("title") or event_ticker,
-                                    "mercado": mercado_nombre,
-                                    "seleccion": m.get(f"{side}_sub_title") or side.upper(),
-                                    "lado": side.upper(),
-                                    "prob_pct": prob * Decimal("100"),
-                                    "precio_usd": prob,
-                                    "vol_ml": vol_ml_evento,
-                                    "vol_mercado": vol_mercado,
-                                    "ticker": m.get("ticker", ""),
-                                }
-                            )
-
-            cursor = ev_data.get("cursor")
-            if not cursor:
-                break
+            for side in ("yes", "no"):
+                prob = get_prob_en_dolares(m, side)
+                if prob is not None and prob <= max_prob:
+                    filas.append(
+                        {
+                            "competicion": competicion,
+                            "partido": evento_titulo,
+                            "mercado": mercado_nombre,
+                            "seleccion": m.get(f"{side}_sub_title") or side.upper(),
+                            "lado": side.upper(),
+                            "prob_pct": prob * Decimal("100"),
+                            "precio_usd": prob,
+                            "vol_ml": vol_ml_evento,
+                            "vol_mercado": vol_mercado,
+                            "ticker": m.get("ticker", ""),
+                        }
+                    )
 
     filas.sort(key=lambda x: (x["partido"], x["prob_pct"]))
-    return filas, len(series_futbol), eventos_vistos, eventos_calificados
+    print(f"Listo en {time.monotonic() - t0:.1f}s.", flush=True)
+    return filas, len(series_futbol), len(mercados_por_evento), eventos_calificados
 
 
 def renderizar_markdown(
@@ -252,7 +282,7 @@ def main():
     filas, total_series, total_eventos, eventos_calificados = obtener_grilla()
     md = renderizar_markdown(filas, total_series, total_eventos, eventos_calificados)
     Path("GRILLA.md").write_text(md, encoding="utf-8")
-    print(md)
+    print(md, flush=True)
 
 
 if __name__ == "__main__":
